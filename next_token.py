@@ -17,7 +17,11 @@
 
 
 import numpy as np
-from scipy.special import logsumexp
+
+
+def logsumexp(z): # NumPy replacement for scipy.special.logsumexp
+    m = np.max(z)
+    return m + np.log(np.sum(np.exp(z - m)))
 
 rng = np.random.default_rng(20261123)
 
@@ -32,9 +36,9 @@ def generate_sequences(B, seed):
     rng = np.random.default_rng(seed)
     S = np.zeros((B, 5), dtype=np.int64)
     S[:, 0] = rng.integers(0, 3, size=B)
-    for i in range(B):
-        for t in range(1, 5):
-            S[i, t] = rng.choice(3, p=A[S[i, t-1]])
+    for t in range(1, 5):
+        cutoffs = np.cumsum(A[S[:, t-1]], axis=1)[:, :-1]
+        S[:, t] = (rng.random((B, 1)) >= cutoffs).sum(axis=1)
     return S
 
 S_train = generate_sequences(20, 20261124)
@@ -56,9 +60,11 @@ X_test, y_test = prepare_data(S_test)
 
 
 def shift_tokens(X):
+    if X.ndim != 2 or len(X) == 0 or X.shape[1] < 2:
+        raise ValueError("Each nonempty batch needs at least two time steps.")
     return X[:, :-1], X[:, 1:] # X2[i][j] is the next element of X1[i][j]. shape (B, T)
 
-def position_nll(X, Z): # X is the target, (B, T).
+def position_nll(Z, X): # Z is the logits, (B, T, V); X is the target, (B, T).
     b, _ = X.shape
     _, t, _ = Z.shape # logits
     l = 0
@@ -91,7 +97,7 @@ if __name__ == "__main__":
     
     expected = np.log(24) / 3
     
-    print(np.isclose(position_nll(X2, W), expected))
+    print(np.isclose(position_nll(W, X2), expected))
 
 
 # Implement `loss_grad`. For the centered difference use float64, $h=10^{-6}$, five dense examples, $d=2$, $K=3$, seed 20261123 and $\lambda=.07$ (the checker constructs all arrays). Run `python next_token.py checks`. Report the largest scaled error for each parameter block. Inspect the permutation and duplication assertions. If one fails, name the quantity and axis you would inspect first. This part also completes November 16, 7(4).
@@ -128,9 +134,9 @@ def loss_grad(X, y, W, b, lam):
 
 #-------- Test ----------
 if __name__ == "__main__":
-    X, y = X_train, y_train
-    W = rng.normal(0, 0.1, size=(3, 3))
-    b = np.zeros(3, dtype=np.float64)
+    rng = np.random.default_rng(20261123)
+    X, y = rng.normal(size=(5, 2)), np.array([2, 0, 2, 1, 2])
+    W, b = rng.normal(size=(2, 3)), rng.normal(size=3)
     lam = 0.07
     h = 1e-6
     
@@ -169,8 +175,18 @@ if __name__ == "__main__":
         1, np.maximum(np.abs(dbJ), np.abs(dbJ_num))
     )
     
-    print(np.max(err_W)) 
+    print(np.max(err_W))
     print(np.max(err_b))
+
+    # Permutation and duplication assertions
+    order = np.array([2, 0, 1]) # Entry j is the old label of new column j.
+    new_y = np.argsort(order)[y]
+    perm = loss_grad(X, new_y, W[:, order], b[order], lam)
+    dup = loss_grad(np.tile(X, (3, 1)), np.tile(y, 3), W, b, lam)
+    for actual, expected in ((perm, (J, dWJ[:, order], dbJ[order])),
+                             (dup, (J, dWJ, dbJ))):
+        for value, oracle in zip(actual, expected):
+            np.testing.assert_allclose(value, oracle, rtol=0, atol=1e-12)
 
 
 # Implement `choose_fit(fits, validation)`. A penalty key indexes a returned $(W,\boldsymbol b)$ pair and its validation NLL. Minimize validation NLL, choosing the larger penalty on an exact tie. Return the key and that fitted pair. Each candidate starts at zero and takes 100 full-batch steps of size $.5$. Compare $\lambda\in\{0,.1\}$. Split seeds are 20261124, 20261125 and 20261126 respectively.
@@ -192,18 +208,19 @@ def full_gradD(X, y, W, b, lam): # incorporated from 11-16-26
         bf = bf - bf.mean()
     return lam, (Wf, bf)
 
-def choose_fit(fits, val): # validation, choosing the hyperparameter.
-    n = len(fits)
-    j = 0
-    for i in range(1, n):
-        if val[i] < val[j] or (val[i] == val[j] and fits[i][0] > fits[j][0]): # comparing the regularization term first.
+def choose_fit(fits, val): # validation, choosing the hyperparameter. Both are dicts keyed by lambda.
+    keys = list(fits)
+    j = keys[0]
+    for i in keys[1:]:
+        if val[i] < val[j] or (val[i] == val[j] and i > j): # comparing the regularization term first.
             j = i
-    return fits[j]
+    W, b = fits[j]
+    return j, W, b
 
 #-----------Test------------
 if __name__ == "__main__":
-    fits = []
-    val = []
+    fits = {}
+    val = {}
     
     d = X_train.shape[1]
     K = A.shape[0]
@@ -218,11 +235,11 @@ if __name__ == "__main__":
         
         Z_train = Wf[S_train[:, :-1]] + bf # We include the information of the initial mapping Z_{ijk} = A_{S_{1,ij},k} here
         Z_val = Wf[S_val[:, :-1]] + bf
-        train_nll = position_nll(S_train[:, 1:], Z_train)
-        val_nll = position_nll(S_val[:, 1:], Z_val)
-    
-        fits.append(fit)
-        val.append(val_nll)
+        train_nll = position_nll(Z_train, S_train[:, 1:])
+        val_nll = position_nll(Z_val, S_val[:, 1:])
+
+        fits[lam] = (Wf, bf)
+        val[lam] = val_nll
     
         print(f"{lam:<9.1f} {train_nll:<12.8f} {val_nll:.8f}")
     
@@ -238,10 +255,10 @@ if __name__ == "__main__":
         )
     
     # Model selection
-    lam_best, (W_best, b_best) = choose_fit(fits, val)
+    lam_best, W_best, b_best = choose_fit(fits, val)
     # Test set evaluation
     Z_test = W_best[S_test[:, :-1]] + b_best
-    test_nll = position_nll(S_test[:, 1:], Z_test)
+    test_nll = position_nll(Z_test, S_test[:, 1:])
     
     test_error = np.mean(
         np.argmax(X_test @ W_best + b_best, axis=1) != y_test
@@ -251,7 +268,7 @@ if __name__ == "__main__":
     print(f"Test error = {test_error:.8f}")
     
     # Verify model selection and exact tie
-    assert val[[fit[0] for fit in fits].index(lam_best)] == min(val)
-    assert choose_fit(fits, [1.0, 1.0])[0] == 0.1
-    assert choose_fit(fits[::-1], [1.0, 1.0])[0] == 0.1
+    assert val[lam_best] == min(val.values())
+    assert choose_fit(fits, {0.0: 1.0, 0.1: 1.0})[0] == 0.1
+    assert choose_fit(dict(reversed(fits.items())), {0.1: 1.0, 0.0: 1.0})[0] == 0.1
 
